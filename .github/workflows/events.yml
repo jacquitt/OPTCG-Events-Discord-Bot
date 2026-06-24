@@ -1,0 +1,48 @@
+name: Card Kaizoku Discord Announcer
+
+on:
+  schedule:
+    # Runs every 6 hours. GitHub cron uses UTC.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Check calendar and post new events
+        run: node index.js
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          POST_EXISTING: "false"
+          MAX_POSTS_PER_RUN: "10"
+
+      - name: Commit updated seen-event list
+        run: |
+          if git diff --quiet data/seen-events.json; then
+            echo "No seen-event changes to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add data/seen-events.json
+            git commit -m "Update seen Card Kaizoku events"
+            git push
+          fi
