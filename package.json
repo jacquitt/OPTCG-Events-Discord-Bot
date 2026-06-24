@@ -1,0 +1,12 @@
+{
+  "name": "cardkaizoku-discord-announcer",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}
