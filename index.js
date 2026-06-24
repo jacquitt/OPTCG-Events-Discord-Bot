@@ -86,7 +86,8 @@ async function scrapeEvents() {
     viewport: { width: 1440, height: 1200 },
   });
 
-  await page.goto(CALENDAR_URL, { waitUntil: "networkidle", timeout: 60000 });
+  await page.goto(CALENDAR_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
+await page.waitForLoadState("load", { timeout: 30000 }).catch(() => {});
 
   // Card Kaizoku is a JS-rendered page, so give React/calendar content time to render.
   await page.waitForFunction(
