@@ -30,7 +30,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           POST_EXISTING: "true"
-          MAX_POSTS_PER_RUN: "20"
+          MAX_POSTS_PER_RUN: "5"
           ALLOWED_REGIONS: "North America"
           STATE_FILE: "data/test-seen-events.json"
 
