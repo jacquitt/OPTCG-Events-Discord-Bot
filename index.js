@@ -135,7 +135,12 @@ await page.waitForLoadState("load", { timeout: 30000 }).catch(() => {});
     () => !document.body.innerText.includes("You need to enable JavaScript"),
     { timeout: 20000 }
   ).catch(() => {});
-  await page.waitForTimeout(3000);
+  await page.waitForFunction(
+  () => /Current & Upcoming Events|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i.test(document.body.innerText),
+  { timeout: 30000 }
+).catch(() => {});
+
+await page.waitForTimeout(5000);
 
   const extracted = await page.evaluate(() => {
     const clean = (text) => String(text || "").replace(/\s+/g, " ").trim();
