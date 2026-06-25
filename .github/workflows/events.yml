@@ -30,17 +30,18 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           POST_EXISTING: "true"
-          MAX_POSTS_PER_RUN: "10"
+          MAX_POSTS_PER_RUN: "20"
+          ALLOWED_REGIONS: "North America"
           STATE_FILE: "data/test-seen-events.json"
 
       - name: Commit updated seen-event list
         run: |
-          if [ -z "$(git status --porcelain data/seen-events.json)" ]; then
+          if [ -z "$(git status --porcelain data)" ]; then
             echo "No seen-event changes to commit."
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add data/seen-events.json
+            git add data
             git commit -m "Update seen official ONE PIECE events"
             git push
           fi
