@@ -40,41 +40,82 @@ async function writeSeenIds(ids) {
 }
 
 function parseEventsFromLines(lines) {
-  const monthPattern = "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)";
-  const dateRegex = new RegExp(`^${monthPattern}\\.?\\s+\\d{1,2},\\s+\\d{4}(?:\\s*[-–]\\s*${monthPattern}\\.?\\s+\\d{1,2},\\s+\\d{4})?`, "i");
+  const month = "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)";
+  const datePattern = `${month}\\.?\\s+\\d{1,2},\\s+\\d{4}(?:\\s*[-–]\\s*${month}\\.?\\s+\\d{1,2},\\s+\\d{4})?`;
+  const dateRegex = new RegExp(datePattern, "i");
+
   const events = [];
 
+  // First try line-by-line parsing.
   for (let i = 0; i < lines.length; i++) {
     const line = clean(lines[i]);
-    const dateMatch = line.match(dateRegex);
+    const dateMatch = line.match(new RegExp(`^${datePattern}`, "i"));
     if (!dateMatch) continue;
 
     const date = clean(dateMatch[0]);
-    let afterDate = clean(line.slice(dateMatch[0].length).replace(/^,/, ""));
+    const rest = clean(line.slice(dateMatch[0].length).replace(/^,/, ""));
 
-    const next1 = clean(lines[i + 1] || "");
-    const next2 = clean(lines[i + 2] || "");
-    const next3 = clean(lines[i + 3] || "");
+    let title = rest || clean(lines[i + 1] || "") || "Untitled Event";
+    let series = clean(lines[i + 2] || "");
+    let type = clean(lines[i + 3] || "");
 
-    // Common layout: date line, organizer/title line, series line, type line
-    let title = afterDate || next1 || "Untitled Event";
-    let series = afterDate ? next1 : next2;
-    let type = afterDate ? next2 : next3;
-
-    // If the title line has bullets/dots from a compact table, split gently.
-    title = title.replace(/^[-•·]+/, "").trim();
-    series = series.replace(/^[-•·]+/, "").trim();
-    type = type.replace(/^[-•·]+/, "").trim();
+    if (title.includes("·")) {
+      const parts = title.split("·").map(clean);
+      title = parts[0] || title;
+      const rightSide = parts.slice(1).join(" · ");
+      const rightParts = rightSide.split(",").map(clean).filter(Boolean);
+      series = rightParts[0] || series;
+      type = rightParts[1] || type;
+    }
 
     if (/current|upcoming|past events|event calendar/i.test(title)) continue;
 
-    events.push({
-      date,
-      title,
-      series,
-      type,
-      url: CALENDAR_URL,
-    });
+    events.push({ date, title, series, type, url: CALENDAR_URL });
+  }
+
+  // Backup parser: Card Kaizoku sometimes renders everything as one big text blob.
+  const allText = clean(lines.join(" ; "));
+  const upcomingOnly = allText
+    .replace(/^.*?Current & Upcoming Events/i, "")
+    .replace(/Past Events.*$/i, "");
+
+  const chunkRegex = new RegExp(`(${datePattern})\\s*,?\\s*(.*?)(?=${datePattern}|$)`, "gi");
+  let match;
+
+  while ((match = chunkRegex.exec(upcomingOnly)) !== null) {
+    const date = clean(match[1]);
+    let chunk = clean(match[match.length - 1]);
+
+    if (!date || !chunk) continue;
+    if (/you need to enable javascript/i.test(chunk)) continue;
+
+    chunk = chunk
+      .replace(/^Current & Upcoming Events/i, "")
+      .replace(/^\s*[-–—:;,]+/, "")
+      .trim();
+
+    let title = "Untitled Event";
+    let series = "";
+    let type = "";
+
+    if (chunk.includes("·")) {
+      const [left, ...right] = chunk.split("·").map(clean);
+      title = left || title;
+
+      const rightText = right.join(" · ");
+      const pieces = rightText.split(",").map(clean).filter(Boolean);
+      series = pieces[0] || "";
+      type = pieces[1] || "";
+    } else {
+      const pieces = chunk.split(",").map(clean).filter(Boolean);
+      title = pieces[0] || title;
+      series = pieces[1] || "";
+      type = pieces[2] || "";
+    }
+
+    if (/current|upcoming|past events|event calendar/i.test(title)) continue;
+
+    events.push({ date, title, series, type, url: CALENDAR_URL });
   }
 
   return events;
