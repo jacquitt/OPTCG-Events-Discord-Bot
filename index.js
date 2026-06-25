@@ -329,24 +329,105 @@ function parseDetailedSchedule(html, pageTitle, detailUrl) {
   return events;
 }
 
-function isFutureOrUpcomingEvent(dateText) {
-  const text = String(dateText || "");
+const MONTHS = {
+  january: 0,
+  february: 1,
+  march: 2,
+  april: 3,
+  may: 4,
+  june: 5,
+  july: 6,
+  august: 7,
+  september: 8,
+  october: 9,
+  november: 10,
+  december: 11,
+};
 
-  const match = text.match(
-    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b/i
+function parseEventStartDate(dateText) {
+  const text = clean(String(dateText || "").replace(/\u200b/g, ""));
+
+  const yearMatch = text.match(/\b(20\d{2})\b/);
+  const monthMatch = text.match(
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\b/i
   );
 
-  if (!match) {
-    return true; // Keep unknown dates like "TBA" instead of accidentally hiding them.
+  if (!yearMatch || !monthMatch) return null;
+
+  const year = Number(yearMatch[1]);
+  const monthName = monthMatch[1].toLowerCase();
+  const month = MONTHS[monthName];
+
+  const afterMonth = text.slice(monthMatch.index + monthMatch[0].length);
+  const dayMatch = afterMonth.match(/\s+(\d{1,2})/);
+
+  // If the official site says something like "August - September 2026",
+  // treat it as the 1st of the first month for sorting/filtering.
+  const day = dayMatch ? Number(dayMatch[1]) : 1;
+
+  return new Date(year, month, day);
+}
+
+function isFutureOrUpcomingEvent(dateText) {
+  const eventDate = parseEventStartDate(dateText);
+
+  if (!eventDate) {
+    return true; // Keep TBA/unknown dates instead of accidentally hiding them.
   }
 
-  const eventDate = new Date(match[0]);
   const today = new Date();
-
-  // Treat today as midnight so same-day events still count.
   today.setHours(0, 0, 0, 0);
 
   return eventDate >= today;
+}
+
+function normalizeEventFields(event) {
+  let date = clean(event.date);
+  let venue = clean(event.venue);
+  let registration = clean(event.registration);
+
+  // Fix cases where the site gets read as:
+  // Date: June 27, 2026 Venue: ... Link: Registration ...
+  const venueFromDate = date.match(/\s+Venue:\s*(.*?)(?:\s+Link:\s*|$)/i);
+  if (!venue && venueFromDate) {
+    venue = clean(venueFromDate[1]);
+  }
+
+  const linkFromDate = date.match(/\s+Link:\s*(.*)$/i);
+  if (!registration && linkFromDate) {
+    registration = clean(linkFromDate[1]);
+  }
+
+  date = clean(date.replace(/\s+Venue:.*$/i, "").replace(/\s+Link:.*$/i, ""));
+
+  // Fix cases where venue contains the registration link.
+  const linkFromVenue = venue.match(/\s+Link:\s*(.*)$/i);
+  if (linkFromVenue) {
+    if (!registration) registration = clean(linkFromVenue[1]);
+    venue = clean(venue.replace(/\s+Link:.*$/i, ""));
+  }
+
+  return {
+    ...event,
+    date,
+    venue,
+    registration,
+  };
+}
+
+function compareEventsChronologically(a, b) {
+  const dateA = parseEventStartDate(a.date);
+  const dateB = parseEventStartDate(b.date);
+
+  if (dateA && dateB) {
+    const diff = dateA.getTime() - dateB.getTime();
+    if (diff !== 0) return diff;
+  }
+
+  if (dateA && !dateB) return -1;
+  if (!dateA && dateB) return 1;
+
+  return `${a.title} ${a.venue}`.localeCompare(`${b.title} ${b.venue}`);
 }
 
 async function scrapeEvents() {
@@ -375,9 +456,12 @@ async function scrapeEvents() {
     }
   }
 
-  const filteredEvents = allEvents.filter((event) => {
+  const filteredEvents = allEvents
+  .map(normalizeEventFields)
+  .filter((event) => {
     return event.region && isAllowedRegion(event.region) && isFutureOrUpcomingEvent(event.date);
-  });
+  })
+  .sort(compareEventsChronologically);
 
   const byId = new Map();
   for (const event of filteredEvents) {
