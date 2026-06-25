@@ -1,27 +1,73 @@
-import { chromium } from "playwright";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const CALENDAR_URL = process.env.CALENDAR_URL || "https://www.cardkaizoku.com/eventcalendar";
+const EVENTS_URL = process.env.EVENTS_URL || "https://en.onepiece-cardgame.com/events/";
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const STATE_FILE = process.env.STATE_FILE || "data/seen-events.json";
 
-// false = first run saves the current list but does NOT spam Discord.
-// true = first run announces everything currently on the calendar.
 const POST_EXISTING = String(process.env.POST_EXISTING || "false").toLowerCase() === "true";
-
-// Safety cap so a bad parse does not spam the channel.
 const MAX_POSTS_PER_RUN = Number(process.env.MAX_POSTS_PER_RUN || 10);
 
 function clean(text) {
-  return String(text || "").replace(/\s+/g, " ").trim();
+  return String(text || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function decodeHtml(text) {
+  return String(text || "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&rsquo;/g, "’")
+    .replace(/&ldquo;/g, "“")
+    .replace(/&rdquo;/g, "”")
+    .replace(/&ndash;/g, "–")
+    .replace(/&mdash;/g, "—")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
+function stripHtmlToLines(html) {
+  const text = decodeHtml(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|li|h1|h2|h3|h4|h5|tr|td|th)>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+  );
+
+  return text
+    .split("\n")
+    .map(clean)
+    .filter(Boolean);
+}
+
+function absoluteUrl(href, baseUrl = EVENTS_URL) {
+  return new URL(href, baseUrl).toString();
+}
+
+async function fetchText(url) {
+  const response = await fetch(url, {
+    headers: {
+      "user-agent": "Mozilla/5.0 Discord event checker",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
+  }
+
+  return response.text();
 }
 
 function eventId(event) {
   return crypto
     .createHash("sha256")
-    .update(`${event.date}|${event.title}|${event.series}|${event.type}|${event.region || ""}`)
+    .update(`${event.source}|${event.date}|${event.title}|${event.region || ""}|${event.venue || ""}`)
     .digest("hex");
 }
 
@@ -39,155 +85,184 @@ async function writeSeenIds(ids) {
   await fs.writeFile(STATE_FILE, JSON.stringify([...ids].sort(), null, 2) + "\n");
 }
 
-function parseEventsFromLines(lines) {
-  const month = "(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)";
-  const datePattern = `${month}\\.?\\s+\\d{1,2},\\s+\\d{4}(?:\\s*[-–]\\s*${month}\\.?\\s+\\d{1,2},\\s+\\d{4})?`;
-  const dateRegex = new RegExp(datePattern, "i");
+function parseMainEventLinks(html) {
+  const links = [];
+  const seen = new Set();
 
-  const events = [];
+  const anchorRegex = /<a\b[^>]*href=["']([^"']*\/events\/[^"']+\.html|[^"']+\.html)["'][^>]*>([\s\S]*?)<\/a>/gi;
 
-  // First try line-by-line parsing.
-  for (let i = 0; i < lines.length; i++) {
-    const line = clean(lines[i]);
-    const dateMatch = line.match(new RegExp(`^${datePattern}`, "i"));
-    if (!dateMatch) continue;
+  let match;
+  while ((match = anchorRegex.exec(html)) !== null) {
+    const href = match[1];
+    const inner = match[2];
 
-    const date = clean(dateMatch[0]);
-    const rest = clean(line.slice(dateMatch[0].length).replace(/^,/, ""));
+    const url = absoluteUrl(href);
+    if (!url.includes("/events/")) continue;
+    if (url.endsWith("/events/")) continue;
+    if (seen.has(url)) continue;
 
-    let title = rest || clean(lines[i + 1] || "") || "Untitled Event";
-    let series = clean(lines[i + 2] || "");
-    let type = clean(lines[i + 3] || "");
+    const text = clean(stripHtmlToLines(inner).join(" "));
+    if (!text || /view all events|past events/i.test(text)) continue;
 
-    if (title.includes("·")) {
-      const parts = title.split("·").map(clean);
-      title = parts[0] || title;
-      const rightSide = parts.slice(1).join(" · ");
-      const rightParts = rightSide.split(",").map(clean).filter(Boolean);
-      series = rightParts[0] || series;
-      type = rightParts[1] || type;
-    }
-
-    if (/current|upcoming|past events|event calendar/i.test(title)) continue;
-
-    events.push({ date, title, series, type, url: CALENDAR_URL });
+    seen.add(url);
+    links.push({ url, text });
   }
 
-  // Backup parser: Card Kaizoku sometimes renders everything as one big text blob.
-  const allText = clean(lines.join(" ; "));
-  const upcomingOnly = allText
-    .replace(/^.*?Current & Upcoming Events/i, "")
-    .replace(/Past Events.*$/i, "");
+  return links;
+}
 
-  const chunkRegex = new RegExp(`(${datePattern})\\s*,?\\s*(.*?)(?=${datePattern}|$)`, "gi");
-  let match;
+function parseTitleFromDetail(html, fallbackText, detailUrl) {
+  const lines = stripHtmlToLines(html);
 
-  while ((match = chunkRegex.exec(upcomingOnly)) !== null) {
-    const date = clean(match[1]);
-    let chunk = clean(match[match.length - 1]);
+  const eventsIndex = lines.findIndex((line) => /^EVENTS$/i.test(line));
+  for (let i = eventsIndex + 1; i < Math.min(lines.length, eventsIndex + 10); i++) {
+    const line = lines[i];
+    if (
+      line &&
+      !/^Image/i.test(line) &&
+      !/^Championship$/i.test(line) &&
+      !/^FOR BEGINNERS$/i.test(line)
+    ) {
+      return clean(line);
+    }
+  }
 
-    if (!date || !chunk) continue;
-    if (/you need to enable javascript/i.test(chunk)) continue;
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleMatch) {
+    return clean(decodeHtml(titleMatch[1]).replace("| ONE PIECE CARD GAME - Official Web Site", ""));
+  }
 
-    chunk = chunk
-      .replace(/^Current & Upcoming Events/i, "")
-      .replace(/^\s*[-–—:;,]+/, "")
-      .trim();
+  const fallback = clean(fallbackText.replace(/Event Period:.*$/i, ""));
+  return fallback || detailUrl;
+}
 
-    let title = "Untitled Event";
-    let series = "";
-    let type = "";
+function parseCardFallback(linkText, detailUrl) {
+  const periodMatch = linkText.match(/Event Period:\s*(.*?)(?:Regulation:|$)/i);
+  const title = clean(linkText.replace(/Event Period:.*$/i, ""));
 
-    if (chunk.includes("·")) {
-      const [left, ...right] = chunk.split("·").map(clean);
-      title = left || title;
+  if (!title || !periodMatch) return null;
 
-      const rightText = right.join(" · ");
-      const pieces = rightText.split(",").map(clean).filter(Boolean);
-      series = pieces[0] || "";
-      type = pieces[1] || "";
-    } else {
-      const pieces = chunk.split(",").map(clean).filter(Boolean);
-      title = pieces[0] || title;
-      series = pieces[1] || "";
-      type = pieces[2] || "";
+  return {
+    title,
+    date: clean(periodMatch[1]),
+    venue: "",
+    region: "",
+    registration: "",
+    source: detailUrl,
+  };
+}
+
+function parseDetailedSchedule(html, pageTitle, detailUrl) {
+  const lines = stripHtmlToLines(html);
+  const events = [];
+
+  const startIndex = lines.findIndex((line) =>
+    /Event Schedule and Tournament Organizer/i.test(line)
+  );
+
+  if (startIndex === -1) return events;
+
+  const stopRegex = /^(Advanced Application Method|Application Period|Prize|Side Event|Tournament Rules|Notes|Important Notes|Products|VIEW ALL EVENTS)$/i;
+  const regionRegex = /^(North America|Europe|Oceania|Latin America|Middle East|Asia|Online)$/i;
+
+  let currentRegion = "";
+  let currentOrganizer = "";
+
+  for (let i = startIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (stopRegex.test(line)) break;
+
+    if (regionRegex.test(line)) {
+      currentRegion = line;
+      currentOrganizer = "";
+      continue;
     }
 
-    if (/current|upcoming|past events|event calendar/i.test(title)) continue;
+    if (/^Date:/i.test(line)) {
+      const date = clean(line.replace(/^Date:\s*/i, ""));
+      let venue = "";
+      let registration = "";
 
-    events.push({ date, title, series, type, url: CALENDAR_URL });
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = lines[j];
+
+        if (stopRegex.test(next)) break;
+        if (regionRegex.test(next)) break;
+        if (/^Date:/i.test(next)) break;
+
+        if (/^Venue:/i.test(next)) {
+          venue = clean(next.replace(/^Venue:\s*/i, ""));
+        } else if (/^Link:/i.test(next)) {
+          registration = clean(next.replace(/^Link:\s*/i, ""));
+        } else if (
+          next &&
+          !/^Registration$/i.test(next) &&
+          !/^TBA$/i.test(next) &&
+          !/:$/.test(next)
+        ) {
+          // Keep scanning; organizer headings are handled outside this block.
+        }
+      }
+
+      events.push({
+        title: currentOrganizer ? `${pageTitle} - ${currentOrganizer}` : pageTitle,
+        date,
+        venue,
+        region: currentRegion,
+        registration,
+        source: detailUrl,
+      });
+
+      continue;
+    }
+
+    if (
+      line &&
+      !/^Overview$/i.test(line) &&
+      !/^Period$/i.test(line) &&
+      !/^Format$/i.test(line) &&
+      !/^Regulation$/i.test(line) &&
+      !/^Date:/i.test(line) &&
+      !/^Venue:/i.test(line) &&
+      !/^Link:/i.test(line)
+    ) {
+      currentOrganizer = line;
+    }
   }
 
   return events;
 }
 
 async function scrapeEvents() {
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({
-    viewport: { width: 1440, height: 1200 },
-  });
+  const mainHtml = await fetchText(EVENTS_URL);
+  const links = parseMainEventLinks(mainHtml);
 
-  await page.goto(CALENDAR_URL, { waitUntil: "domcontentloaded", timeout: 120000 });
-await page.waitForLoadState("load", { timeout: 30000 }).catch(() => {});
+  console.log(`Found ${links.length} official event pages.`);
 
-  // Card Kaizoku is a JS-rendered page, so give React/calendar content time to render.
-  await page.waitForFunction(
-    () => !document.body.innerText.includes("You need to enable JavaScript"),
-    { timeout: 20000 }
-  ).catch(() => {});
-  await page.waitForFunction(
-  () => /Current & Upcoming Events|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/i.test(document.body.innerText),
-  { timeout: 30000 }
-).catch(() => {});
+  const allEvents = [];
 
-await page.waitForTimeout(5000);
+  for (const link of links) {
+    try {
+      const detailHtml = await fetchText(link.url);
+      const pageTitle = parseTitleFromDetail(detailHtml, link.text, link.url);
 
-  const extracted = await page.evaluate(() => {
-    const clean = (text) => String(text || "").replace(/\s+/g, " ").trim();
+      const detailedEvents = parseDetailedSchedule(detailHtml, pageTitle, link.url);
 
-    const tableEvents = [];
-    for (const row of Array.from(document.querySelectorAll("tr"))) {
-      const cells = Array.from(row.querySelectorAll("th, td"))
-        .map((cell) => clean(cell.innerText))
-        .filter(Boolean);
-
-      if (cells.length >= 3 && /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}/i.test(cells[0])) {
-        tableEvents.push({
-          date: cells[0],
-          title: cells[1] || "Untitled Event",
-          series: cells[2] || "",
-          type: cells[3] || "",
-          url: window.location.href,
-        });
+      if (detailedEvents.length) {
+        allEvents.push(...detailedEvents);
+      } else {
+        const fallback = parseCardFallback(link.text, link.url);
+        if (fallback) allEvents.push(fallback);
       }
+    } catch (error) {
+      console.log(`Could not parse ${link.url}: ${error.message}`);
     }
-
-    const lines = document.body.innerText
-      .split("\n")
-      .map(clean)
-      .filter(Boolean);
-
-    return { tableEvents, lines };
-  });
-
-  await browser.close();
-
-  let events = extracted.tableEvents;
-  if (!events.length) {
-    events = parseEventsFromLines(extracted.lines);
   }
 
-  // Deduplicate and remove obvious junk.
   const byId = new Map();
-  for (const event of events) {
-    event.date = clean(event.date);
-    event.title = clean(event.title);
-    event.series = clean(event.series);
-    event.type = clean(event.type);
-
-    if (!event.date || !event.title) continue;
-    if (/you need to enable javascript/i.test(`${event.date} ${event.title}`)) continue;
-
+  for (const event of allEvents) {
+    if (!event.title || !event.date) continue;
     byId.set(eventId(event), event);
   }
 
@@ -195,26 +270,40 @@ await page.waitForTimeout(5000);
 }
 
 function discordPayload(event) {
-  const descriptionParts = [];
-  if (event.series) descriptionParts.push(`**Series:** ${event.series}`);
-  if (event.type) descriptionParts.push(`**Type:** ${event.type}`);
+  const fields = [
+    {
+      name: "Date",
+      value: event.date || "TBA",
+      inline: true,
+    },
+  ];
+
+  if (event.region) {
+    fields.push({
+      name: "Region",
+      value: event.region,
+      inline: true,
+    });
+  }
+
+  if (event.venue) {
+    fields.push({
+      name: "Venue",
+      value: event.venue.slice(0, 1024),
+      inline: false,
+    });
+  }
 
   return {
-    username: "Card Kaizoku Events",
+    username: "ONE PIECE Events",
     embeds: [
       {
         title: `🏴‍☠️ ${event.title}`,
-        url: event.url,
-        description: descriptionParts.join("\n") || "New event added.",
-        fields: [
-          {
-            name: "Date",
-            value: event.date,
-            inline: true,
-          },
-        ],
+        url: event.source,
+        description: "New official ONE PIECE CARD GAME event found.",
+        fields,
         footer: {
-          text: "Source: Card Kaizoku Event Calendar",
+          text: "Source: Official ONE PIECE CARD GAME website",
         },
       },
     ],
@@ -245,10 +334,10 @@ async function main() {
   const hadExistingState = seenIds.size > 0;
 
   const events = await scrapeEvents();
-  console.log(`Found ${events.length} events.`);
+  console.log(`Found ${events.length} official events.`);
 
   if (!events.length) {
-    console.log("No events found. Not updating seen file, because the page may have changed.");
+    console.log("No events found. Not updating seen file.");
     process.exitCode = 1;
     return;
   }
@@ -257,20 +346,20 @@ async function main() {
   console.log(`New events: ${newEvents.length}`);
 
   if (!hadExistingState && !POST_EXISTING) {
-    console.log("First run: saving current events as baseline without posting.");
+    console.log("First run: saving current official events as baseline without posting.");
     for (const event of events) seenIds.add(eventId(event));
     await writeSeenIds(seenIds);
     return;
   }
 
   const toPost = newEvents.slice(0, MAX_POSTS_PER_RUN);
+
   for (const event of toPost) {
     await postToDiscord(event);
     seenIds.add(eventId(event));
     console.log(`Posted: ${event.date} - ${event.title}`);
   }
 
-  // Add all currently known events after successful run so old calendar items do not repost.
   for (const event of events) seenIds.add(eventId(event));
   await writeSeenIds(seenIds);
 
