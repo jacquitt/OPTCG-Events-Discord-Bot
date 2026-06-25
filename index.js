@@ -516,13 +516,12 @@ async function main() {
   const toPost = newEvents.slice(0, MAX_POSTS_PER_RUN);
 
   for (const event of toPost) {
-    await postToDiscord(event);
-    seenIds.add(eventId(event));
-    console.log(`Posted: ${event.date} - ${event.title}`);
-  }
+  await postToDiscord(event);
+  seenIds.add(eventId(event));
+  console.log(`Posted: ${event.date} - ${event.title}`);
+}
 
-  for (const event of events) seenIds.add(eventId(event));
-  await writeSeenIds(seenIds);
+await writeSeenIds(seenIds);
 
   if (newEvents.length > toPost.length) {
     console.log(`Skipped ${newEvents.length - toPost.length} events due to MAX_POSTS_PER_RUN.`);
