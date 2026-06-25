@@ -32,7 +32,7 @@ jobs:
           POST_EXISTING: "true"
           MAX_POSTS_PER_RUN: "20"
           ALLOWED_REGIONS: "North America"
-          STATE_FILE: "data/test-na-seen-events-v2.json"
+          STATE_FILE: "data/test-na-chrono-v1.json"
 
       - name: Commit updated seen-event list
         run: |
