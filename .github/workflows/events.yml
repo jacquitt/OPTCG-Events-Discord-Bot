@@ -29,8 +29,9 @@ jobs:
         run: node index.js
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          POST_EXISTING: "false"
+          POST_EXISTING: "true"
           MAX_POSTS_PER_RUN: "10"
+          STATE_FILE: "data/test-seen-events.json"
 
       - name: Commit updated seen-event list
         run: |
