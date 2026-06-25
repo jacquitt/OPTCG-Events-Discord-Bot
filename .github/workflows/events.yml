@@ -30,9 +30,9 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           POST_EXISTING: "true"
-          MAX_POSTS_PER_RUN: "5"
+          MAX_POSTS_PER_RUN: "20"
           ALLOWED_REGIONS: "North America"
-          STATE_FILE: "data/test-seen-events.json"
+          STATE_FILE: "data/test-na-seen-events-v2.json"
 
       - name: Commit updated seen-event list
         run: |
