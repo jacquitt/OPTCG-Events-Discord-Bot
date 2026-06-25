@@ -9,6 +9,15 @@ const STATE_FILE = process.env.STATE_FILE || "data/seen-events.json";
 const POST_EXISTING = String(process.env.POST_EXISTING || "false").toLowerCase() === "true";
 const MAX_POSTS_PER_RUN = Number(process.env.MAX_POSTS_PER_RUN || 10);
 
+// Default: only North America.
+// You can override this in GitHub Actions with ALLOWED_REGIONS.
+const ALLOWED_REGIONS = new Set(
+  String(process.env.ALLOWED_REGIONS || "North America")
+    .split(",")
+    .map((region) => region.trim().toLowerCase())
+    .filter(Boolean)
+);
+
 function clean(text) {
   return String(text || "")
     .replace(/\u00a0/g, " ")
@@ -30,9 +39,22 @@ function decodeHtml(text) {
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
 }
 
-function stripHtmlToLines(html) {
+function absoluteUrl(href, baseUrl = EVENTS_URL) {
+  return new URL(href, baseUrl).toString();
+}
+
+function stripHtmlToLines(html, baseUrl = EVENTS_URL) {
+  const htmlWithLinksPreserved = html.replace(
+    /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi,
+    (_, href, inner) => {
+      const label = clean(inner.replace(/<[^>]+>/g, " "));
+      const url = absoluteUrl(decodeHtml(href), baseUrl);
+      return label ? `${label} ${url}` : url;
+    }
+  );
+
   const text = decodeHtml(
-    html
+    htmlWithLinksPreserved
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<style[\s\S]*?<\/style>/gi, "")
       .replace(/<br\s*\/?>/gi, "\n")
@@ -44,10 +66,6 @@ function stripHtmlToLines(html) {
     .split("\n")
     .map(clean)
     .filter(Boolean);
-}
-
-function absoluteUrl(href, baseUrl = EVENTS_URL) {
-  return new URL(href, baseUrl).toString();
 }
 
 async function fetchText(url) {
@@ -64,10 +82,95 @@ async function fetchText(url) {
   return response.text();
 }
 
+function standardRegion(region) {
+  const cleaned = clean(region);
+
+  if (/^north america$/i.test(cleaned)) return "North America";
+  if (/^europe$/i.test(cleaned)) return "Europe";
+  if (/^oceania$/i.test(cleaned)) return "Oceania";
+  if (/^latin america$/i.test(cleaned)) return "Latin America";
+  if (/^middle east$/i.test(cleaned)) return "Middle East";
+  if (/^asia$/i.test(cleaned)) return "Asia";
+  if (/^online$/i.test(cleaned)) return "Online";
+
+  return cleaned;
+}
+
+function isAllowedRegion(region) {
+  if (!ALLOWED_REGIONS.size) return true;
+  return ALLOWED_REGIONS.has(clean(region).toLowerCase());
+}
+
+function getFirstMonthFromDate(dateText) {
+  const match = String(dateText || "").match(
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\b/i
+  );
+
+  if (!match) return "";
+  return match[1].charAt(0).toUpperCase() + match[1].slice(1).toLowerCase();
+}
+
+function parseApplicationInfo(lines) {
+  const monthSignupDates = {};
+  const regionSignupTimes = {};
+
+  const startIndex = lines.findIndex((line) => /^Application Period$/i.test(line));
+
+  if (startIndex === -1) {
+    return { monthSignupDates, regionSignupTimes };
+  }
+
+  const stopRegex = /^(Prize|Side Event|Tournament Rules|Notes|Important Notes|Products|VIEW ALL EVENTS)$/i;
+
+  for (let i = startIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (stopRegex.test(line)) break;
+
+    const monthMatch = line.match(/^For\s+(.+?)\s+Events?:\s*(.+)$/i);
+    if (monthMatch) {
+      const month = clean(monthMatch[1]);
+      const signupDate = clean(monthMatch[2]);
+      monthSignupDates[month] = signupDate;
+      continue;
+    }
+
+    const regionMatch = line.match(/^(North America|Europe|Oceania|Latin America|Middle East|Asia|Online):\s*(.+)$/i);
+    if (regionMatch) {
+      const region = standardRegion(regionMatch[1]);
+      const time = clean(regionMatch[2]);
+      regionSignupTimes[region] = time;
+      continue;
+    }
+  }
+
+  return { monthSignupDates, regionSignupTimes };
+}
+
+function getSignupGuide(event, applicationInfo) {
+  const month = getFirstMonthFromDate(event.date);
+  const signupDate = applicationInfo.monthSignupDates[month] || "";
+  const signupTime = applicationInfo.regionSignupTimes[event.region] || "";
+
+  if (signupDate && signupTime) {
+    return `${signupDate} at ${signupTime}`;
+  }
+
+  if (signupDate) return signupDate;
+  if (signupTime) return signupTime;
+
+  return "";
+}
+
+function getFirstUrl(text) {
+  const match = String(text || "").match(/https?:\/\/\S+/i);
+  return match ? match[0] : "";
+}
+
 function eventId(event) {
   return crypto
     .createHash("sha256")
-    .update(`${event.source}|${event.date}|${event.title}|${event.region || ""}|${event.venue || ""}`)
+    .update(`${event.source}|${event.date}|${event.title}|${event.region || ""}|${event.venue || ""}|${event.signupGuide || ""}`)
     .digest("hex");
 }
 
@@ -112,24 +215,17 @@ function parseMainEventLinks(html) {
 }
 
 function parseTitleFromDetail(html, fallbackText, detailUrl) {
-  const lines = stripHtmlToLines(html);
-
-  const eventsIndex = lines.findIndex((line) => /^EVENTS$/i.test(line));
-  for (let i = eventsIndex + 1; i < Math.min(lines.length, eventsIndex + 10); i++) {
-    const line = lines[i];
-    if (
-      line &&
-      !/^Image/i.test(line) &&
-      !/^Championship$/i.test(line) &&
-      !/^FOR BEGINNERS$/i.test(line)
-    ) {
-      return clean(line);
-    }
-  }
+  const lines = stripHtmlToLines(html, detailUrl);
 
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   if (titleMatch) {
-    return clean(decodeHtml(titleMatch[1]).replace("| ONE PIECE CARD GAME - Official Web Site", ""));
+    const title = clean(
+      decodeHtml(titleMatch[1])
+        .replace("| ONE PIECE CARD GAME - Official Web Site", "")
+        .replace("｜ONE PIECE CARD GAME - Official Web Site", "")
+    );
+
+    if (title) return title;
   }
 
   const fallback = clean(fallbackText.replace(/Event Period:.*$/i, ""));
@@ -148,12 +244,14 @@ function parseCardFallback(linkText, detailUrl) {
     venue: "",
     region: "",
     registration: "",
+    signupGuide: "",
     source: detailUrl,
   };
 }
 
 function parseDetailedSchedule(html, pageTitle, detailUrl) {
-  const lines = stripHtmlToLines(html);
+  const lines = stripHtmlToLines(html, detailUrl);
+  const applicationInfo = parseApplicationInfo(lines);
   const events = [];
 
   const startIndex = lines.findIndex((line) =>
@@ -174,7 +272,7 @@ function parseDetailedSchedule(html, pageTitle, detailUrl) {
     if (stopRegex.test(line)) break;
 
     if (regionRegex.test(line)) {
-      currentRegion = line;
+      currentRegion = standardRegion(line);
       currentOrganizer = "";
       continue;
     }
@@ -195,25 +293,22 @@ function parseDetailedSchedule(html, pageTitle, detailUrl) {
           venue = clean(next.replace(/^Venue:\s*/i, ""));
         } else if (/^Link:/i.test(next)) {
           registration = clean(next.replace(/^Link:\s*/i, ""));
-        } else if (
-          next &&
-          !/^Registration$/i.test(next) &&
-          !/^TBA$/i.test(next) &&
-          !/:$/.test(next)
-        ) {
-          // Keep scanning; organizer headings are handled outside this block.
         }
       }
 
-      events.push({
+      const event = {
         title: currentOrganizer ? `${pageTitle} - ${currentOrganizer}` : pageTitle,
         date,
         venue,
         region: currentRegion,
         registration,
+        signupGuide: "",
         source: detailUrl,
-      });
+      };
 
+      event.signupGuide = getSignupGuide(event, applicationInfo);
+
+      events.push(event);
       continue;
     }
 
@@ -260,8 +355,12 @@ async function scrapeEvents() {
     }
   }
 
+  const filteredEvents = allEvents.filter((event) => {
+    return event.region && isAllowedRegion(event.region);
+  });
+
   const byId = new Map();
-  for (const event of allEvents) {
+  for (const event of filteredEvents) {
     if (!event.title || !event.date) continue;
     byId.set(eventId(event), event);
   }
@@ -276,13 +375,18 @@ function discordPayload(event) {
       value: event.date || "TBA",
       inline: true,
     },
+    {
+      name: "Region",
+      value: event.region || "TBA",
+      inline: true,
+    },
   ];
 
-  if (event.region) {
+  if (event.signupGuide) {
     fields.push({
-      name: "Region",
-      value: event.region,
-      inline: true,
+      name: "Sign-up guide",
+      value: `${event.signupGuide}\nExact time may vary by organizer.`,
+      inline: false,
     });
   }
 
@@ -294,13 +398,22 @@ function discordPayload(event) {
     });
   }
 
+  if (event.registration) {
+    const registrationUrl = getFirstUrl(event.registration);
+    fields.push({
+      name: "Registration",
+      value: registrationUrl ? `[Registration link](${registrationUrl})` : event.registration.slice(0, 1024),
+      inline: false,
+    });
+  }
+
   return {
     username: "ONE PIECE Events",
     embeds: [
       {
         title: `🏴‍☠️ ${event.title}`,
         url: event.source,
-        description: "New official ONE PIECE CARD GAME event found.",
+        description: "New North America official ONE PIECE CARD GAME event found.",
         fields,
         footer: {
           text: "Source: Official ONE PIECE CARD GAME website",
@@ -334,10 +447,10 @@ async function main() {
   const hadExistingState = seenIds.size > 0;
 
   const events = await scrapeEvents();
-  console.log(`Found ${events.length} official events.`);
+  console.log(`Found ${events.length} North America official events.`);
 
   if (!events.length) {
-    console.log("No events found. Not updating seen file.");
+    console.log("No North America events found. Not updating seen file.");
     process.exitCode = 1;
     return;
   }
@@ -346,7 +459,7 @@ async function main() {
   console.log(`New events: ${newEvents.length}`);
 
   if (!hadExistingState && !POST_EXISTING) {
-    console.log("First run: saving current official events as baseline without posting.");
+    console.log("First run: saving current North America official events as baseline without posting.");
     for (const event of events) seenIds.add(eventId(event));
     await writeSeenIds(seenIds);
     return;
