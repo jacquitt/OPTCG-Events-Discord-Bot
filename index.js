@@ -329,6 +329,26 @@ function parseDetailedSchedule(html, pageTitle, detailUrl) {
   return events;
 }
 
+function isFutureOrUpcomingEvent(dateText) {
+  const text = String(dateText || "");
+
+  const match = text.match(
+    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b/i
+  );
+
+  if (!match) {
+    return true; // Keep unknown dates like "TBA" instead of accidentally hiding them.
+  }
+
+  const eventDate = new Date(match[0]);
+  const today = new Date();
+
+  // Treat today as midnight so same-day events still count.
+  today.setHours(0, 0, 0, 0);
+
+  return eventDate >= today;
+}
+
 async function scrapeEvents() {
   const mainHtml = await fetchText(EVENTS_URL);
   const links = parseMainEventLinks(mainHtml);
@@ -356,7 +376,7 @@ async function scrapeEvents() {
   }
 
   const filteredEvents = allEvents.filter((event) => {
-    return event.region && isAllowedRegion(event.region);
+    return event.region && isAllowedRegion(event.region) && isFutureOrUpcomingEvent(event.date);
   });
 
   const byId = new Map();
