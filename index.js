@@ -423,6 +423,10 @@ function discordPayload(event) {
   };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function postToDiscord(event) {
   if (!DISCORD_WEBHOOK_URL) {
     console.log("[DRY RUN] No DISCORD_WEBHOOK_URL set. Would post:");
@@ -430,16 +434,40 @@ async function postToDiscord(event) {
     return;
   }
 
-  const response = await fetch(DISCORD_WEBHOOK_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(discordPayload(event)),
-  });
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const response = await fetch(DISCORD_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(discordPayload(event)),
+    });
 
-  if (!response.ok) {
+    if (response.ok) {
+      // Small delay so Discord does not get spammed too fast.
+      await sleep(2000);
+      return;
+    }
+
     const body = await response.text().catch(() => "");
+
+    if (response.status === 429) {
+      let retryAfterMs = 1800;
+
+      try {
+        const data = JSON.parse(body);
+        if (data.retry_after) {
+          retryAfterMs = Math.ceil(Number(data.retry_after) * 1000) + 1000;
+        }
+      } catch {}
+
+      console.log(`Discord rate limited. Waiting ${retryAfterMs}ms, then retrying...`);
+      await sleep(retryAfterMs);
+      continue;
+    }
+
     throw new Error(`Discord webhook failed: ${response.status} ${response.statusText} ${body}`);
   }
+
+  throw new Error("Discord webhook failed after too many retry attempts.");
 }
 
 async function main() {
